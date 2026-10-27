@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pybirdbuddy"
-version = "0.1.1"
+version = "0.1.1+google.1"
 description = "A library to query data about a Bird Buddy smart bird feeder"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,7 +33,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jhansche/pybirdbuddy"
+Homepage = "https://github.com/oliviacpu/pybirdbuddy"
 
 [tool.setuptools.packages.find]
 include = ["birdbuddy*"]

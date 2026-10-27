@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +12,7 @@ from python_graphql_client import GraphqlClient
 from typing_extensions import deprecated
 
 from birdbuddy import LOGGER, VERBOSE, queries
+from birdbuddy.auth import AuthTokens
 from birdbuddy.const import BB_URL
 from birdbuddy.exceptions import (
     AuthenticationFailedError,
@@ -84,6 +85,7 @@ class BirdBuddy:
         /,
         refresh_token: str | None = None,
         access_token: str | None = None,
+        tokens_updated: Callable[[AuthTokens], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize the Bird Buddy client.
 
@@ -92,11 +94,14 @@ class BirdBuddy:
             password: Account password, for password login.
             refresh_token: An existing refresh token, to skip password login.
             access_token: An existing access token.
+            tokens_updated: Called after login or refresh, before further API calls.
         """
         self._email = email
         self._password = password
         self._refresh_token = refresh_token
         self._access_token = access_token
+        self._tokens_updated = tokens_updated
+        self._auth_lock = asyncio.Lock()
 
         self.graphql = GraphqlClient(BB_URL)
         self._me = None
@@ -141,13 +146,80 @@ class BirdBuddy:
         return await self._make_request(query=DUMP_SCHEMA, auth=False)
 
     async def _check_auth(self) -> bool:
-        if self._needs_login():
-            LOGGER.debug("Login required")
-            return await self._login()
-        if self._needs_refresh():
-            LOGGER.debug("Access token needs to be refreshed")
-            await self._refresh_access_token()
+        async with self._auth_lock:
+            if self._needs_login():
+                LOGGER.debug("Login required")
+                return await self._login()
+            if self._needs_refresh():
+                LOGGER.debug("Access token needs to be refreshed")
+                try:
+                    await self._refresh_access_token()
+                except AuthenticationFailedError:
+                    if self._email and self._password:
+                        return await self._login()
+                    raise
         return not self._needs_login()
+
+    @property
+    def tokens(self) -> AuthTokens | None:
+        """Return the current Bird Buddy session, when signed in."""
+        if not self._refresh_token:
+            return None
+        return AuthTokens(self._access_token, self._refresh_token)
+
+    async def _store_tokens(self, result: dict) -> None:
+        """Validate and persist a newly issued session."""
+        access = result.get("accessToken")
+        refresh = result.get("refreshToken")
+        if not isinstance(access, str) or not access:
+            raise UnexpectedResponseError
+        if not isinstance(refresh, str) or not refresh:
+            raise UnexpectedResponseError
+        self._access_token = access
+        self._refresh_token = refresh
+        if self._tokens_updated is not None:
+            await self._tokens_updated(AuthTokens(access, refresh))
+
+    async def sign_in_google(self, google_access_token: str) -> bool:
+        """Exchange a Google access token for an existing Bird Buddy account.
+
+        Args:
+            google_access_token: A Google OAuth token with userinfo.email scope.
+
+        Returns:
+            True once the Bird Buddy session and profile have been saved.
+
+        Raises:
+            AuthenticationFailedError: Google sign-in was rejected by Bird Buddy.
+        """
+        if not google_access_token:
+            msg = "A Google access token is required"
+            raise AuthenticationFailedError(msg)
+        async with self._auth_lock:
+            try:
+                data = await self._make_request(
+                    query=queries.auth.GOOGLE_SIGN_IN,
+                    variables={
+                        "socialSignInInput": {
+                            "provider": "GOOGLE",
+                            "token": google_access_token,
+                        }
+                    },
+                    auth=False,
+                )
+            except GraphqlError as err:
+                if (err.error_code or "").startswith("AUTH_"):
+                    msg = "Google sign-in rejected"
+                    raise AuthenticationFailedError(msg) from None
+                raise
+            result = data.get("authSocialSignIn") or {}
+            if result.get("__typename") == "Problem":
+                msg = "Google sign-in rejected"
+                raise AuthenticationFailedError(msg)
+            if not isinstance(result.get("me"), dict):
+                raise UnexpectedResponseError
+            await self._store_tokens(result)
+            return self._save_me(result["me"])
 
     async def _login(self) -> bool:
         """Sign in with email/password and store the tokens.
@@ -175,12 +247,16 @@ class BirdBuddy:
                 auth=False,
             )
         except GraphqlError as err:
-            LOGGER.exception("Error logging in: %s", err)
-            raise AuthenticationFailedError(err) from err
+            if (err.error_code or "").startswith("AUTH_"):
+                msg = "Password sign-in rejected"
+                raise AuthenticationFailedError(msg) from None
+            raise
 
         result = data["authEmailSignIn"]
-        self._access_token = result["accessToken"]
-        self._refresh_token = result["refreshToken"]
+        if result.get("__typename") == "Problem":
+            msg = "Password sign-in rejected"
+            raise AuthenticationFailedError(msg)
+        await self._store_tokens(result)
         return self._save_me(result["me"])
 
     async def _refresh_access_token(self) -> bool:
@@ -208,13 +284,14 @@ class BirdBuddy:
                 auth=False,
             )
         except GraphqlError as exc:
-            LOGGER.exception("Error refreshing access token: %s", exc)
-            self._refresh_token = None
-            raise AuthenticationFailedError(exc) from exc
+            if (exc.error_code or "").startswith("AUTH_"):
+                self._clear()
+                msg = "Bird Buddy session expired"
+                raise AuthenticationFailedError(msg) from None
+            raise
 
         tokens = data["authRefreshToken"]
-        self._access_token = tokens.get("accessToken")
-        self._refresh_token = tokens.get("refreshToken")
+        await self._store_tokens(tokens)
         LOGGER.info("Access token refreshed")
         return not self._needs_refresh()
 
@@ -252,6 +329,7 @@ class BirdBuddy:
         should_redact = query in [
             queries.auth.REFRESH_AUTH_TOKEN,
             queries.auth.SIGN_IN,
+            queries.auth.GOOGLE_SIGN_IN,
         ]
         LOGGER.debug(
             "> GraphQL %s, vars=%s",
@@ -268,10 +346,16 @@ class BirdBuddy:
             raise NoResponseError
 
         errors = response.get("errors", [])
+        if should_redact:
+            errors = [
+                {"extensions": {"code": e.get("extensions", {}).get("code")}}
+                for e in errors
+            ]
         try:
             GraphqlError.raise_errors(errors)
         except AuthTokenExpiredError:
-            self._access_token = None
+            if headers.get("Authorization") == f"Bearer {self._access_token}":
+                self._access_token = None
             if auth and reauth:
                 # login and try again
                 return await self._make_request(
@@ -284,7 +368,7 @@ class BirdBuddy:
 
         result = response.get("data")
         if not isinstance(result, dict):
-            raise UnexpectedResponseError(response)
+            raise UnexpectedResponseError(None if should_redact else response)
 
         LOGGER.log(VERBOSE, "< response: %s", _redact(result, should_redact))
         if subscript:

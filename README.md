@@ -43,11 +43,26 @@ pprint.pprint(result)
 pprint.pprint(bb.feeders)
 ```
 
-Note: only password login is supported currently. Google and other SSOs are
-not supported. If you've already set up your Bird Buddy with SSO, one option
-could be to register a new account with a password, and then redeem an invite
-code to your Bird Buddy under the new account. Some fields will be missing
-(such as firmware versions and off-grid status).
+### Google-linked accounts
+
+Google sign-in is supported by this fork. The caller obtains a Google OAuth
+access token with the `https://www.googleapis.com/auth/userinfo.email` scope,
+then exchanges it for a Bird Buddy session:
+
+```python
+bb = BirdBuddy(tokens_updated=save_session)
+await bb.sign_in_google(google_access_token)
+```
+
+`save_session` is an async callback receiving an immutable `AuthTokens` snapshot.
+Persist its `refresh_token` privately whenever the callback runs; Bird Buddy can
+rotate it during renewal. Restore with
+`BirdBuddy(refresh_token=saved_token, tokens_updated=save_session)`.
+The Google token is used only for the initial exchange. The library never stores
+it. The account must already exist in Bird Buddy and be linked to Google.
+
+Password login remains supported. Concurrent API calls share a serialized token
+refresh, and temporary API failures retain the session for retry.
 
 The `feeders` property will be an array of feeders with the following fields:
 

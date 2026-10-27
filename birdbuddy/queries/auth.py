@@ -179,6 +179,20 @@ fragment ProblemFields on Problem {
 }
 """.strip()
 
+GOOGLE_SIGN_IN = (
+    """
+mutation googleSignIn($socialSignInInput: SocialSignInInput!) {
+  authSocialSignIn(socialSignInInput: $socialSignInInput) {
+    ... on Auth { ...AuthInitFields }
+    ... on Problem { ...ProblemFields }
+    __typename
+  }
+}
+""".strip()
+    + "\n"
+    + SIGN_IN[SIGN_IN.index("fragment AuthInitFields") :]
+)
+
 REFRESH_AUTH_TOKEN = """
 mutation authRefreshToken($refreshTokenInput: RefreshTokenInput!) {
   authRefreshToken(refreshTokenInput: $refreshTokenInput) {
